@@ -144,6 +144,12 @@ class GRPOConfig(TrainingArguments):
             "out-of-memory (OOM) errors during initialization."
         },
     )
+    vllm_kv_cache_dtype: Optional[str] = field(
+        default="auto",
+        metadata={
+            "Quantizing the KV cache to FP8 reduces its memory footprint. This increases the number of tokens that can be stored in the cache, improving throughput."
+        },
+    )
 
     # Parameters that control the training
     learning_rate: float = field(
