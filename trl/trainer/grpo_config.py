@@ -65,6 +65,9 @@ class GRPOConfig(TrainingArguments):
             device dedicated to generation powered by vLLM. Higher values will increase the KV cache size and thus
             improve the model's throughput. However, if the value is too high, it may cause out-of-memory (OOM) errors
             during initialization.
+        vllm_kv_cache_dtype (`str`, *optional*, defaults to `auto`):
+            Quantizing the KV cache to FP8 reduces its memory footprint. This increases the number of tokens that can
+            be stored in the cache, improving throughput.
 
         > Parameters that control the training
 
