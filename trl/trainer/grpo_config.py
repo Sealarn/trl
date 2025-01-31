@@ -150,7 +150,8 @@ class GRPOConfig(TrainingArguments):
     vllm_kv_cache_dtype: Optional[str] = field(
         default="auto",
         metadata={
-            "Quantizing the KV cache to FP8 reduces its memory footprint. This increases the number of tokens that can be stored in the cache, improving throughput."
+            "help": "Quantizing the KV cache to FP8 reduces its memory footprint. This increases the number of tokens "
+            "that can be stored in the cache, improving throughput."
         },
     )
 
