@@ -12,7 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import copy
 import os
+import shutil
 import textwrap
 import warnings
 from collections import defaultdict
@@ -47,10 +49,14 @@ from .utils import generate_model_card, get_comet_experiment_url, pad
 
 
 if is_peft_available():
-    from peft import PeftConfig, get_peft_model
+    from peft import LoraConfig, PeftConfig, PeftModel, get_peft_model
 
 if is_vllm_available():
     from vllm import LLM, SamplingParams
+    from vllm.lora.request import LoRARequest
+
+    # Enable runtime LoRA updating on every new checkpoint
+    os.environ["VLLM_ALLOW_RUNTIME_LORA_UPDATING"] = "True"
 
 if is_wandb_available():
     import wandb
@@ -194,8 +200,18 @@ class GRPOTrainer(Trainer):
                     "This argument can only be used when the `model` argument is a string."
                 )
 
+        # Track whether we're using LoRA and the rank of the LoRA adapter
+        lora_rank = 0
         if peft_config is not None:
             model = get_peft_model(model, peft_config)
+            if isinstance(peft_config, LoraConfig):
+                lora_rank = peft_config.r
+        self.lora_rank = lora_rank
+        self.use_lora = lora_rank > 0
+
+        # LoRA request for the current checkpoint weights.
+        # Kept as state to account for gradient accumulation 
+        self.lora_request = None
 
         # Reference model
         if is_deepspeed_zero3_enabled():
@@ -310,12 +326,20 @@ class GRPOTrainer(Trainer):
                     "vllm.worker.worker.Worker._assert_memory_footprint_increased_during_profiling", return_value=None
                 )
                 with world_size_patch, profiling_patch:
+                    lora_kwargs = {}
+                    if self.use_lora:
+                        # Only set these if using LoRA so we don't have to worry about backwards compatibility as
+                        # vLLM changes its defaults.
+                        lora_kwargs["enable_lora"] = True
+                        lora_kwargs["max_lora_rank"] = self.lora_rank
+
                     self.llm = LLM(
                         model=model.name_or_path,
                         device=vllm_device,
                         gpu_memory_utilization=self.args.vllm_gpu_memory_utilization,
                         max_model_len=self.max_prompt_length+self.max_completion_length,
                         kv_cache_dtype=self.args.vllm_kv_cache_dtype,
+                        **lora_kwargs,
                     )
                 self.sampling_params = SamplingParams(
                     n=self.num_generations,
@@ -323,7 +347,7 @@ class GRPOTrainer(Trainer):
                     max_tokens=self.max_completion_length,
                 )
 
-            self._last_loaded_step = 0  # tag to avoid useless loading during grad checkpointing
+            self._last_loaded_step = 0  # tag to avoid useless loading during grad accumulation
 
             # When using vLLM, the main process is responsible for loading the model weights. This can cause process
             # desynchronization and seems to lead to DeepSpeed hanging during initialization. To prevent this, we
@@ -389,17 +413,49 @@ class GRPOTrainer(Trainer):
         if self.args.use_vllm:
             # First, have main process load weights if needed
             if self.state.global_step != self._last_loaded_step:
-                with unwrap_model_for_generation(model, self.accelerator) as unwrapped_model:
-                    state_dict = unwrapped_model.state_dict()
-                if self.accelerator.is_main_process:
-                    llm_model = self.llm.llm_engine.model_executor.driver_worker.model_runner.model
-                    llm_model.load_weights(state_dict.items())
+                if self.use_lora:
+                    # vLLM supports natively loading LoRA weights dynamically at runtime, so 
+                    # save weights to a temporary directory and prepare a request for the vLLM runtime.
+                    intermediate_checkpoint_dir = os.path.join(
+                        self.args.output_dir, f".vllm-lora-checkpoint-{self.state.global_step}"
+                    )
+                    model.save_pretrained(intermediate_checkpoint_dir)
+                    self.tokenizer.save_pretrained(intermediate_checkpoint_dir)
+                    self.lora_request = LoRARequest(
+                        f"vllm-lora-checkpoint-{self.state.global_step}",
+                        self.state.global_step,
+                        lora_path=intermediate_checkpoint_dir,
+                    )
+
+                    # Cleanup previous checkpoint
+                    last_global_step = self.state.global_step - 1
+                    last_checkpoint_dir = os.path.join(
+                        self.args.output_dir, f".vllm-lora-checkpoint-{last_global_step}"
+                    )
+                    if os.path.exists(last_checkpoint_dir):
+                        shutil.rmtree(last_checkpoint_dir)
+                else:
+                    # If not using LoRA, we load the full model weights in vLLM
+                    with unwrap_model_for_generation(model, self.accelerator) as unwrapped_model:
+                        if isinstance(unwrapped_model, PeftModel):
+                            unwrapped_model = copy.deepcopy(unwrapped_model)
+                            unwrapped_model.merge_and_unload()
+                            state_dict = unwrapped_model.state_dict()
+
+                    if self.accelerator.is_main_process:
+                        llm_model = self.llm.llm_engine.model_executor.driver_worker.model_runner.model
+                        llm_model.load_weights(state_dict.items())
                 self._last_loaded_step = self.state.global_step
 
             # Generate completions using vLLM: gather all prompts and use them in a single call in the main process
             all_prompts_text = gather_object(prompts_text)
             if self.accelerator.is_main_process:
-                outputs = self.llm.generate(all_prompts_text, sampling_params=self.sampling_params, use_tqdm=False)
+                outputs = self.llm.generate(
+                    all_prompts_text,
+                    sampling_params=self.sampling_params, 
+                    lora_request=self.lora_request, 
+                    use_tqdm=False,
+                )
                 completion_ids = [out.token_ids for completions in outputs for out in completions.outputs]
             else:
                 completion_ids = [None] * len(all_prompts_text) * self.num_generations
@@ -446,11 +502,11 @@ class GRPOTrainer(Trainer):
         per_token_logps = get_per_token_logps(model, prompt_completion_ids, num_logits_to_keep)
 
         with torch.inference_mode():
-            if self.ref_model is not None:
-                ref_per_token_logps = get_per_token_logps(self.ref_model, prompt_completion_ids, num_logits_to_keep)
-            else:
-                with self.accelerator.unwrap_model(model).disable_adapter():
+            if isinstance(model, PeftModel):
+                with model.disable_adapter():
                     ref_per_token_logps = get_per_token_logps(model, prompt_completion_ids, num_logits_to_keep)
+            else:
+                ref_per_token_logps = get_per_token_logps(self.ref_model, prompt_completion_ids, num_logits_to_keep)
 
         # Compute the KL divergence between the model and the reference model
         per_token_kl = torch.exp(ref_per_token_logps - per_token_logps) - (ref_per_token_logps - per_token_logps) - 1
