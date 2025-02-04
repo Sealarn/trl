@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import copy
 import os
 import textwrap
 import warnings
@@ -47,7 +48,7 @@ from .utils import compute_logps_with_prompt_cache, generate_model_card, get_com
 
 
 if is_peft_available():
-    from peft import PeftConfig, get_peft_model
+    from peft import PeftConfig, PeftModel, get_peft_model
 
 if is_vllm_available():
     from vllm import LLM, SamplingParams
@@ -392,7 +393,10 @@ class GRPOTrainer(Trainer):
             # First, have main process load weights if needed
             if self.state.global_step != self._last_loaded_step:
                 with unwrap_model_for_generation(model, self.accelerator) as unwrapped_model:
-                    state_dict = unwrapped_model.state_dict()
+                    if isinstance(unwrapped_model, PeftModel):
+                        unwrapped_model = copy.deepcopy(unwrapped_model)
+                        unwrapped_model.merge_and_unload()
+                        state_dict = unwrapped_model.state_dict()
                 if self.accelerator.is_main_process:
                     llm_model = self.llm.llm_engine.model_executor.driver_worker.model_runner.model
                     llm_model.load_weights(state_dict.items())
@@ -479,23 +483,23 @@ class GRPOTrainer(Trainer):
             )
 
             with torch.inference_mode():
-                if self.ref_model is not None:
-                    ref_per_token_logps = get_per_token_logps(
-                        model=self.ref_model,
-                        input_ids=prompt_completion_ids,
-                        attention_mask=attention_mask,
-                        logits_to_keep=logits_to_keep,
-                        mini_batch_size=mini_batch_size,
-                    )
-                else:
-                    with self.accelerator.unwrap_model(model).disable_adapter():
+                if isinstance(model, PeftModel):
+                    with model.disable_adapter():
                         ref_per_token_logps = get_per_token_logps(
-                            model=model,
+                            model=self.ref_model,
                             input_ids=prompt_completion_ids,
                             attention_mask=attention_mask,
                             logits_to_keep=logits_to_keep,
                             mini_batch_size=mini_batch_size,
                         )
+                else:
+                    ref_per_token_logps = get_per_token_logps(
+                        model=model,
+                        input_ids=prompt_completion_ids,
+                        attention_mask=attention_mask,
+                        logits_to_keep=logits_to_keep,
+                        mini_batch_size=mini_batch_size,
+                    )
 
         # If gradient checkpointing is not used, we can compute the prompt once and re-use the cache to greatly reduce VRAM usage
         else:
