@@ -314,6 +314,7 @@ class GRPOTrainer(Trainer):
                 with world_size_patch, profiling_patch:
                     self.llm = LLM(
                         model=model.name_or_path,
+                        quantization="bitsandbytes", load_format="bitsandbytes",
                         device=vllm_device,
                         gpu_memory_utilization=self.args.vllm_gpu_memory_utilization,
                         max_model_len=self.max_prompt_length+self.max_completion_length,
